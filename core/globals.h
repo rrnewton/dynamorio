@@ -416,6 +416,15 @@ typedef struct _client_data_t {
 
     /* Flag for dr_invoke_syscall_as_app(). */
     bool skip_client_syscall_events;
+#ifdef LINUX
+    /* Non-NULL only during an explicitly guarded returning invocation. The
+     * pointer names that invocation's stack-owned refusal result, not a guest
+     * errno or a general syscall policy. Nested invocations restore it. */
+    bool *returning_shared_vm_refused;
+    /* Current dr_syscall_injection_purpose_t; zero is ordinary application
+     * interposition. Each returning/legacy invocation restores its caller. */
+    uint returning_syscall_purpose;
+#endif
 } client_data_t;
 
 #ifdef UNIX
@@ -624,6 +633,8 @@ exiting_dynamorio(void);
 
 void
 handle_system_call(dcontext_t *dcontext);
+app_pc
+get_prior_syscall_pc(dcontext_t *dcontext, app_pc post_syscall_pc);
 
 /* self-protection */
 void

@@ -993,6 +993,41 @@ bool
 dr_unregister_module_unload_event(void (*func)(void *drcontext,
                                                const module_data_t *info));
 
+DR_API
+/**
+ * Registers a read-only notification that DR has irrevocably replaced a
+ * stopped target thread's raw continuation during synchronized cache relocation
+ * or detach.  A successful queued safe-spot replacement also produces this
+ * event: it need not already be installed in the operating system.
+ *
+ * The callback runs before the target resumes and before its old cache may be
+ * reclaimed, with the target's lifetime protected by DR's synchronization locks.
+ * It may execute on another thread.  Use the supplied target drcontext to access
+ * already allocated client TLS; the executing thread's TLS is not the target's.
+ * The copied source_pc is the abandoned raw PC.  The copied target_pc is the
+ * translated application continuation, not DR's reset-exit stub.
+ *
+ * This event does not provide a mutable machine context.  The callback may only
+ * invalidate its own target-specific execution metadata.  It must not block,
+ * take client/application locks, suspend threads, flush code, redirect execution,
+ * or call dr_set_mcontext().  It must not retain pointers to callback arguments.
+ *
+ * No event is produced for a query, a failed translation/context replacement, or
+ * a signal that resumes its raw continuation.  This is not a notification of
+ * every application control transfer.  Signal delivery retains its separate
+ * kernel-transfer event; current-thread detach retires client TLS through the
+ * thread-exit event before its final native transfer.
+ */
+void
+dr_register_cache_context_invalidation_event(
+    void (*func)(void *drcontext, app_pc source_pc, app_pc target_pc));
+
+DR_API
+/** Unregisters a cache-context invalidation notification; returns false if absent. */
+bool
+dr_unregister_cache_context_invalidation_event(
+    void (*func)(void *drcontext, app_pc source_pc, app_pc target_pc));
+
 /** Identifies the type of kernel transfer for dr_register_kernel_xfer_event(). */
 typedef enum {
     DR_XFER_SIGNAL_DELIVERY,      /**< Signal delivery to application handler. */
@@ -1471,6 +1506,59 @@ DR_API
  */
 bool dr_unregister_signal_event(dr_signal_action_t (*func)(void *drcontext,
                                                            dr_siginfo_t *siginfo));
+
+/** The readiness decision for an owned pending-signal continuation. */
+typedef enum {
+    DR_SIGNAL_ADMISSION_BYPASS, /**< Use the ordinary DR signal path. */
+    DR_SIGNAL_ADMISSION_WAIT,   /**< Finish the client's existing continuation first. */
+    DR_SIGNAL_ADMISSION_START,  /**< Capture and transfer to the admission continuation. */
+} dr_signal_admission_status_t;
+
+/** A callback-scoped view of a detached, DR-owned Linux pending signal. */
+typedef struct _dr_signal_admission_t {
+    uint64 token; /**< Owner-thread generation; never a pending-list pointer. */
+    int sig;     /**< Kernel-reported signal number. */
+    byte siginfo[128]; /**< Authentic Linux siginfo_t bytes. */
+    const dr_mcontext_t *mcontext; /**< Prepared delivery context (may restart a syscall). */
+} dr_signal_admission_t;
+
+/**
+ * A non-blocking native continuation selector. With event and redirect NULL,
+ * return WAIT only while an existing client continuation still owns this thread,
+ * BYPASS to use the ordinary path, or START to admit a pending signal. With a
+ * non-NULL event, copy any needed fields, fill redirect with the private stub's
+ * full context, and return START. Neither callback may invoke an application Tool.
+ * The latter callback runs outside the pending-list critical section. No pointer
+ * supplied to it remains valid afterwards. Only one admission owner is supported.
+ */
+typedef dr_signal_admission_status_t (*dr_signal_admission_cb_t)(
+    void *drcontext, const dr_signal_admission_t *event, dr_mcontext_t *redirect);
+
+DR_API
+/** Register the owner of delayed Linux x86-64 signal admission. */
+bool dr_register_signal_admission_event(dr_signal_admission_cb_t func);
+
+DR_API
+/** Unregister a previously registered owner (only after its tokens retire). */
+bool dr_unregister_signal_admission_event(dr_signal_admission_cb_t func);
+
+DR_API
+/**
+ * Consume an owned token from its thread's private continuation clean call.
+ * delivery_signal=0 suppresses; the original signal number commits delivery.
+ * A different signal number is rejected: this API does not synthesize a new
+ * Linux signal or its provenance.
+ * replacement may be NULL; a non-NULL Linux siginfo must name the original
+ * reported signal and is used only when delivering that signal. registers may
+ * be NULL, or contain explicit Tool register updates. Without updates suppression
+ * restores the ordinary interrupted context, not a restart-adjusted frame.
+ * This preserves DR's mask, disposition, default-action and frame machinery.
+ * Success does not return. Invalid/stale/cross-thread tokens return false.
+ * Immediate faults continue to use the ordinary signal callback.
+ */
+bool dr_signal_admission_resume(void *drcontext, uint64 token, int delivery_signal,
+                                const byte *replacement,
+                                const dr_mcontext_t *registers);
 #endif /* UNIX */
 
 DR_API

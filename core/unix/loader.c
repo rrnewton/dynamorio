@@ -47,6 +47,7 @@
 #ifdef LINUX
 #    include "include/syscall.h"
 #    include "memquery.h"
+#    include "bootstrap_private_segments.h"
 #    define _GNU_SOURCE 1
 #    define __USE_GNU 1
 #    include <link.h> /* struct dl_phdr_info, must be prior to dlfcn.h */
@@ -236,6 +237,69 @@ privload_add_gdb_cmd(elf_loader_t *loader, const char *filename, bool reachable)
 }
 #endif
 
+#if defined(LINUX) && !defined(STATIC_LIBRARY)
+_Static_assert(PRIVATE_RESERVATION_CAPACITY == DR_PRIVATE_RESERVATION_MAX &&
+                   PRIVATE_RESERVATION_CAPACITY == BOOTSTRAP_PRIVATE_MAX_RANGES,
+               "private ownership interval capacities must agree");
+/* Bind pure LOAD derivation to the authenticated loader owner and safe reads.
+ * The test compiles the same calculations, but obtains its live expected image
+ * independently from OS mappings and the resolved imported DR code address. */
+static size_t
+bootstrap_private_load_segments(privmod_t *mod, byte **starts, size_t *sizes)
+{
+    ELF_HEADER_TYPE header;
+    ELF_PROGRAM_HEADER_TYPE headers[BOOTSTRAP_PRIVATE_MAX_PHDRS];
+    bootstrap_private_load_t loads[BOOTSTRAP_PRIVATE_MAX_PHDRS];
+    bootstrap_private_segment_t recorded[BOOTSTRAP_PRIVATE_MAX_PHDRS + 1];
+    bootstrap_private_segment_t result[BOOTSTRAP_PRIVATE_MAX_RANGES];
+    ptr_uint_t base = (ptr_uint_t)mod->base;
+    if (!mod->bootstrap_dr_owner || !mod->externally_loaded ||
+        mod->base != get_dynamorio_dll_start() ||
+        mod->size != (size_t)(get_dynamorio_dll_end() - mod->base) ||
+        base > POINTER_MAX - mod->size ||
+        !d_r_safe_read(mod->base, sizeof(header), &header) ||
+        !is_elf_so_header((byte *)&header, sizeof(header)) ||
+        header.e_ident[EI_CLASS] != IF_X64_ELSE(ELFCLASS64, ELFCLASS32) ||
+        header.e_ident[EI_DATA] != ELFDATA2LSB ||
+        header.e_ident[EI_VERSION] != EV_CURRENT)
+        return 0;
+    size_t table_size;
+    if (!bootstrap_private_table_size(mod->size, header.e_phoff, header.e_phnum,
+                                      header.e_phentsize, sizeof(header),
+                                      sizeof(headers[0]), &table_size) ||
+        !d_r_safe_read(mod->base + header.e_phoff, table_size, headers))
+        return 0;
+    size_t load_count = 0;
+    for (uint i = 0; i < header.e_phnum; ++i) {
+        ELF_PROGRAM_HEADER_TYPE *ph = &headers[i];
+        if (ph->p_type == PT_LOAD) {
+            loads[load_count++] = (bootstrap_private_load_t){
+                ph->p_vaddr, ph->p_memsz, ph->p_filesz, ph->p_offset,
+                TEST(PF_R, ph->p_flags)
+            };
+        }
+    }
+    os_module_data_t *data = &libdr_opd->os_data;
+    if (data->segments == NULL || data->num_segments > BOOTSTRAP_PRIVATE_MAX_PHDRS + 1)
+        return 0;
+    for (uint i = 0; i < data->num_segments; ++i) {
+        recorded[i] = (bootstrap_private_segment_t){
+            (ptr_uint_t)data->segments[i].start, (ptr_uint_t)data->segments[i].end
+        };
+    }
+    bootstrap_private_image_t image = {
+        base, mod->size, PAGE_SIZE, header.e_phoff + table_size,
+        loads, load_count, recorded, data->num_segments
+    };
+    size_t count = bootstrap_private_segments(&image, result);
+    for (size_t i = 0; i < count; ++i) {
+        starts[i] = (byte *)result[i].start;
+        sizes[i] = result[i].end - result[i].start;
+    }
+    return count;
+}
+#endif
+
 /* os specific loader initialization prologue before finalizing the load. */
 void
 os_loader_init_prologue(void)
@@ -281,6 +345,15 @@ os_loader_init_prologue(void)
         }
     });
     mod->externally_loaded = true;
+#    ifdef LINUX
+    /* This exact bootstrap image has an established owner before client loading.
+     * No other externally_loaded module acquires this exception. */
+    mod->bootstrap_dr_owner = true;
+    byte *starts[PRIVATE_RESERVATION_CAPACITY] = { 0 };
+    size_t sizes[PRIVATE_RESERVATION_CAPACITY] = { 0 };
+    size_t count = bootstrap_private_load_segments(mod, starts, sizes);
+    heap_set_bootstrap_private_segments(starts, sizes, count);
+#    endif
 #    ifdef LINUX /*i#1285*/
     if (DYNAMO_OPTION(early_inject)) {
         /* libdynamorio isn't visible to gdb so add to the cmd list */
@@ -325,6 +398,8 @@ os_loader_init_epilogue(void)
 void
 os_loader_exit(void)
 {
+    /* Withdraw before the loader frees the metadata which authenticated it. */
+    heap_set_bootstrap_private_segments(NULL, NULL, 0);
     if (libdr_opd != NULL) {
         HEAP_ARRAY_FREE(GLOBAL_DCONTEXT, libdr_opd->os_data.segments, module_segment_t,
                         libdr_opd->os_data.alloc_segments, ACCT_OTHER, PROTECTED);
@@ -410,6 +485,13 @@ privload_unmap_file(privmod_t *privmod)
     uint i;
     os_privmod_data_t *opd = (os_privmod_data_t *)privmod->os_privmod_data;
 
+#ifdef LINUX
+    if (privmod->reservation.active) {
+        privload_release_private_image(&privmod->reservation);
+        goto free_segments;
+    }
+#endif
+
     /* unmap segments */
     IF_DEBUG(size_t size_unmapped = 0);
     for (i = 0; i < opd->os_data.num_segments; i++) {
@@ -440,6 +522,7 @@ privload_unmap_file(privmod_t *privmod)
         d_r_unmap_file(privmod->base + privmod->size, PAGE_SIZE);
         DODEBUG({ size_unmapped += PAGE_SIZE; });
     }
+free_segments:
     /* free segments */
     HEAP_ARRAY_FREE(GLOBAL_DCONTEXT, opd->os_data.segments, module_segment_t,
                     opd->os_data.alloc_segments, ACCT_OTHER, PROTECTED);
@@ -462,6 +545,12 @@ privload_map_flags(modload_flags_t init_flags)
     /* XXX: Keep this condition matching the check in privload_unmap_file()
      * (minus MODLOAD_NOT_PRIVLIB since non-privlibs don't reach our unmap).
      */
+    /* Reverie: no separating page after the images mapped for the app (its
+     * own, whose break starts at that page, and its interpreter) where the
+     * client answers the app's brk.
+     */
+    if (TEST(MODLOAD_IS_APP, init_flags) && getenv(DYNAMORIO_VAR_TOOL_ANSWERS_BRK) != NULL)
+        return init_flags;
     if (INTERNAL_OPTION(separate_private_bss) && !TEST(MODLOAD_NOT_PRIVLIB, init_flags)) {
         /* place an extra no-access page after .bss */
         /* XXX: update privload_early_inject call to init_emulated_brk if this changes */
@@ -514,9 +603,10 @@ overlap_map_file_func(file_t f, size_t *size DR_PARAM_INOUT, uint64 offs, app_pc
 /* This only maps, as relocation for ELF requires processing imports first,
  * which we have to delay at init time at least.
  */
-app_pc
-privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
-                          modload_flags_t flags)
+static app_pc
+privload_map_image(const char *filename, size_t *size DR_PARAM_OUT,
+                  modload_flags_t flags,
+                  private_image_reservation_t *reservation DR_PARAM_OUT)
 {
 #ifdef LINUX
     map_fn_t map_func;
@@ -566,6 +656,7 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
             SYSLOG(SYSLOG_ERROR, CLIENT_LIBRARY_WRONG_BITWIDTH, 3, get_application_name(),
                    get_application_pid(), filename);
         }
+        elf_loader_destroy(&loader);
         return NULL;
     }
     base = elf_loader_map_phdrs(&loader, false /* fixed */, map_func, unmap_func,
@@ -574,9 +665,32 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
     if (base != NULL) {
         if (size != NULL)
             *size = loader.image_size;
+        if (reservation != NULL) {
+            loader.reservation.accounted = map_func == d_r_map_file;
+            *reservation = loader.reservation;
+            memset(&loader.reservation, 0, sizeof(loader.reservation));
+        }
 
         if (!TEST(MODLOAD_NOT_PRIVLIB, flags))
             privload_add_gdb_cmd(&loader, filename, TEST(MODLOAD_REACHABLE, flags));
+    } else if (TEST(MODLOAD_PRIVATE_VMM, flags)) {
+        if (loader.reservation.active) {
+            SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                 "private image VMM ownership indeterminate after "
+                                  "fixed mapping or restoration failure: %s", filename);
+            os_terminate(NULL, TERMINATE_PROCESS);
+        }
+        SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0, "%s: %s",
+                             loader.private_error != NULL ? loader.private_error
+                                                          : "private image load failed",
+                             filename);
+        /* Initial clients are loaded before heap initialization.  Returning NULL
+         * here would let add_client_lib's release-build error path run the app
+         * without its requested client.  Optional auxiliary loads after startup
+         * may still report a known-owned refusal to their caller.
+         */
+        if (!dynamo_heap_initialized && !standalone_library)
+            os_terminate(NULL, TERMINATE_PROCESS);
     }
     elf_loader_destroy(&loader);
 
@@ -586,6 +700,63 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
     return NULL;
 #endif
 }
+
+app_pc
+privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
+                         modload_flags_t flags)
+{
+    return privload_map_image(filename, size, flags, NULL);
+}
+
+#ifdef LINUX
+app_pc
+privload_map_private_image(const char *filename, size_t *size DR_PARAM_OUT,
+                          modload_flags_t flags,
+                          private_image_reservation_t *reservation DR_PARAM_OUT)
+{
+    memset(reservation, 0, sizeof(*reservation));
+    return privload_map_image(filename, size, flags | MODLOAD_PRIVATE_VMM, reservation);
+}
+
+bool
+privload_has_private_owner(const privmod_t *mod)
+{
+    const private_image_reservation_t *r = &mod->reservation;
+    if (mod->bootstrap_dr_owner && mod->externally_loaded &&
+        mod->base == get_dynamorio_dll_start() &&
+        mod->size == (size_t)(get_dynamorio_dll_end() - get_dynamorio_dll_start()))
+        return true;
+    if (r->active && !r->indeterminate && !mod->externally_loaded && r->base == mod->base &&
+        r->size >= mod->size && r->size <= (ptr_uint_t)-1 - (ptr_uint_t)r->base &&
+        is_vmm_reserved_address(r->base, r->size, NULL, NULL))
+        return true;
+    SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                         "private image reuse lacks an allocation owner: %s", mod->path);
+    return false;
+}
+
+void
+privload_release_private_image(private_image_reservation_t *reservation)
+{
+    if (!reservation->active)
+        return;
+    if (reservation->indeterminate) {
+        SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                             "private image VMM release refused: ownership indeterminate");
+        os_terminate(NULL, TERMINATE_PROCESS);
+    }
+    reservation->indeterminate = true;
+    bool restored = reservation->accounted
+        ? d_r_unmap_file(reservation->base, reservation->size)
+        : os_unmap_file(reservation->base, reservation->size);
+    if (!restored) {
+        SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                             "private image VMM whole-allocation release failed");
+        os_terminate(NULL, TERMINATE_PROCESS);
+    }
+    memset(reservation, 0, sizeof(*reservation));
+}
+#endif
 
 bool
 privload_process_imports(privmod_t *mod)
@@ -607,7 +778,10 @@ privload_process_imports(privmod_t *mod)
             name = strtab + dyn->d_un.d_val;
             LOG(GLOBAL, LOG_LOADER, 2, "%s: %s imports from %s\n", __FUNCTION__,
                 mod->name, name);
-            if (privload_lookup(name) == NULL) {
+            privmod_t *existing = privload_lookup(name);
+            if (existing != NULL && !privload_has_private_owner(existing))
+                return false;
+            if (existing == NULL) {
                 privmod_t *impmod =
                     privload_locate_and_load(name, mod, false /*client dir=>true*/);
                 if (impmod == NULL)
@@ -904,6 +1078,12 @@ privload_load_private_library(const char *name, bool reachable)
     app_pc res = NULL;
     acquire_recursive_lock(&privload_lock);
     newmod = privload_lookup(name);
+#ifdef LINUX
+    if (newmod != NULL && !privload_has_private_owner(newmod)) {
+        release_recursive_lock(&privload_lock);
+        return NULL;
+    }
+#endif
     if (newmod == NULL)
         newmod = privload_locate_and_load(name, NULL, reachable);
     else
@@ -923,7 +1103,8 @@ privload_load_finalized(privmod_t *mod)
 /* If runpath, then DT_RUNPATH is searched; else, DT_RPATH. */
 static bool
 privload_search_rpath(privmod_t *mod, bool runpath, const char *name,
-                      char *filename DR_PARAM_OUT /* buffer size is MAXIMUM_PATH */)
+                      char *filename DR_PARAM_OUT /* buffer size is MAXIMUM_PATH */,
+                      bool add_client_paths)
 {
 #ifdef LINUX
     os_privmod_data_t *opd;
@@ -973,7 +1154,7 @@ privload_search_rpath(privmod_t *mod, bool runpath, const char *name,
                     snprintf(path, BUFFER_SIZE_ELEMENTS(path), "%.*s", len, list);
                     NULL_TERMINATE_BUFFER(path);
                 }
-                if (mod->is_client) {
+                if (mod->is_client && add_client_paths) {
                     /* We are adding a client's lib rpath to the general search path. This
                      * is not bullet proof compliant with what the loader should really
                      * do. The real problem is that the loader is walking library
@@ -1020,6 +1201,44 @@ privload_search_rpath(privmod_t *mod, bool runpath, const char *name,
     return false;
 }
 
+/* A client may directly need both A and B, with B later in DT_NEEDED. If A is
+ * found before searching the client's RUNPATH, depth-first loading can reach
+ * A's import of B before the client's RUNPATH has been considered. Consult that
+ * direct declaration only after the ordinary search fails. Do not promote paths
+ * here: RUNPATH does not supply arbitrary indirect dependencies, and existing
+ * successful search choices must retain their precedence.
+ */
+static bool
+privload_search_client_runpath(const char *name,
+                              char *filename DR_PARAM_OUT /* MAXIMUM_PATH */)
+{
+#ifdef LINUX
+    /* DT_NEEDED entries containing '/' are pathnames, not searched SONAMEs. */
+    if (strchr(name, '/') != NULL)
+        return false;
+    ASSERT_OWN_RECURSIVE_LOCK(true, &privload_lock);
+    for (privmod_t *mod = privload_first_module(); mod != NULL;
+         mod = privload_next_module(mod)) {
+        if (!mod->is_top_level_client || mod->os_privmod_data == NULL)
+            continue;
+        os_privmod_data_t *opd = (os_privmod_data_t *)mod->os_privmod_data;
+        ELF_DYNAMIC_ENTRY_TYPE *dyn = (ELF_DYNAMIC_ENTRY_TYPE *)opd->dyn;
+        const char *strtab = (const char *)opd->os_data.dynstr;
+        if (dyn == NULL || strtab == NULL)
+            continue;
+        for (; dyn->d_tag != DT_NULL; ++dyn) {
+            if (dyn->d_tag == DT_NEEDED && strcmp(strtab + dyn->d_un.d_val, name) == 0) {
+                if (privload_search_rpath(mod, true /*runpath*/, name, filename,
+                                          false /*do not promote paths*/))
+                    return true;
+                break;
+            }
+        }
+    }
+#endif
+    return false;
+}
+
 static bool
 privload_locate(const char *name, privmod_t *dep,
                 char *filename DR_PARAM_OUT /* buffer size is MAXIMUM_PATH */,
@@ -1040,7 +1259,8 @@ privload_locate(const char *name, privmod_t *dep,
      */
     /* the loader search order: */
     /* 0) DT_RPATH */
-    if (dep != NULL && privload_search_rpath(dep, false /*rpath*/, name, filename))
+    if (dep != NULL &&
+        privload_search_rpath(dep, false /*rpath*/, name, filename, true /*promote paths*/))
         return true;
 
     /* 1) client lib dir */
@@ -1087,7 +1307,8 @@ privload_locate(const char *name, privmod_t *dep,
     }
 
     /* 4) DT_RUNPATH */
-    if (dep != NULL && privload_search_rpath(dep, true /*runpath*/, name, filename))
+    if (dep != NULL &&
+        privload_search_rpath(dep, true /*runpath*/, name, filename, true /*promote paths*/))
         return true;
 
     /* 5) XXX i#460: We use our system paths instead of /etc/ld.so.cache. */
@@ -1111,6 +1332,9 @@ privload_locate(const char *name, privmod_t *dep,
             module_file_has_module_header(filename))
             return true;
     }
+
+    if (privload_search_client_runpath(name, filename))
+        return true;
 
     /* Cannot find the library */
     /* There's a syslog in loader_init() but we want to provide the lib name */
@@ -1847,6 +2071,12 @@ takeover_ptrace(ptrace_stack_args_t *args)
 static void
 reserve_brk(app_pc post_app)
 {
+    /* Reverie: a client that answers the app's brk itself never uses the
+     * kernel's break nor an emulated one, so reserve neither: no emulated
+     * region, and no nudge of the kernel's break.
+     */
+    if (getenv(DYNAMORIO_VAR_TOOL_ANSWERS_BRK) != NULL)
+        return;
     /* We haven't parsed the options yet, so we rely on drinjectlib
      * setting this env var if the user passed -no_emulate_brk:
      */
@@ -2169,6 +2399,167 @@ reload_dynamorio(void **init_sp, app_pc conflict_start, app_pc conflict_end)
     ASSERT_NOT_REACHED();
 }
 
+/* Removes DR's and the launcher's private variables from the application's
+ * initial environment, so the application sees the environment it was given
+ * rather than the injector's (its configuration directory, its exe path, and
+ * the launcher's prefixed variables named in DYNAMORIO_VAR_HIDE_ENV_PREFIXES).
+ *
+ * DR reads its environment through our_environ, which is the application's
+ * array: at a followed execve it re-reads DYNAMORIO_CONFIGDIR from it, and
+ * os_page_size_init() reads the auxv that follows it. So DR first switches to
+ * a private copy of the array and the auxv, with its own copy of each hidden
+ * string. Then the application's array is compacted, moving the complete auxv
+ * down with the remaining entries, and each hidden string is erased, since the
+ * kernel's /proc/self/environ range still covers it. The stack pointer, argv,
+ * and the remaining strings do not move.
+ *
+ * privload_setup_auxv() pointed AT_EXECFN into DYNAMORIO_EXE_PATH's value. The
+ * path moves to kernel_execfn, the exec filename the kernel's own AT_EXECFN
+ * named (on the stack, just above the environment strings): the kernel exec'd
+ * DR's library, whose path is usually longer than the application's. A longer
+ * path goes into a private anonymous mapping DR does not track instead (this
+ * runs on the application's initial stack, so the stack cannot be grown here).
+ * If even that cannot be mapped, it goes into the erased DYNAMORIO_EXE_PATH
+ * entry's own storage, which /proc/self/environ then shows. The storage is
+ * chosen before anything is changed.
+ * Either way the string stays outside the kernel's /proc/self/environ range
+ * and outside DR's heap: DR's heap is freed at detach, and DR's execve cleanup
+ * frees DR-heap entries of a failed execve's environment, which the
+ * application could have passed this string as.
+ *
+ * Whether an entry is hidden is decided once, while copying: a hidden entry is
+ * exactly one whose copy is DR's own string. If the environment names the
+ * prefix list more than once, the first one is used, as getenv() would.
+ *
+ * This runs after the client is initialized; a client that needs a hidden
+ * variable after that keeps its own copy.
+ */
+static void
+privload_hide_app_env(void **sp, char *kernel_execfn)
+{
+    ptr_int_t argc = *(ptr_int_t *)sp;
+    char **envp = (char **)sp + 1 + argc + 1;
+    const char *prefixes = NULL;
+    size_t prefix_var_len = strlen(DYNAMORIO_VAR_HIDE_ENV_PREFIXES);
+    size_t num_env = 0, num_auxv = 0, hidden_chars = 0, i, j;
+    ELF_AUXV_TYPE *auxv, *copy_auxv;
+    char **copy, **dst, *strings;
+    const char *execfn = NULL, *execfn_copy = NULL;
+    char *execfn_target = NULL, *execfn_entry = NULL;
+    size_t size, execfn_len = 0;
+
+    for (i = 0; envp[i] != NULL; i++) {
+        if (prefixes == NULL &&
+            strncmp(envp[i], DYNAMORIO_VAR_HIDE_ENV_PREFIXES, prefix_var_len) == 0 &&
+            envp[i][prefix_var_len] == '=')
+            prefixes = envp[i] + prefix_var_len + 1;
+    }
+    num_env = i;
+    for (i = 0; i < num_env; i++) {
+        if (env_entry_hidden_from_app(envp[i], prefixes))
+            hidden_chars += strlen(envp[i]) + 1;
+    }
+    if (hidden_chars == 0)
+        return;
+    auxv = (ELF_AUXV_TYPE *)(envp + num_env + 1);
+    while (auxv[num_auxv].a_type != AT_NULL) {
+        if (auxv[num_auxv].a_type == AT_EXECFN)
+            execfn = (const char *)auxv[num_auxv].a_un.a_val;
+        num_auxv++;
+    }
+    num_auxv++; /* AT_NULL */
+
+    size = sizeof(char *) * (num_env + 1) + sizeof(ELF_AUXV_TYPE) * num_auxv +
+        hidden_chars;
+    {
+        /* A plain mapping rather than DR's heap: our_environ must stay valid
+         * across a detach and a later re-attach, which free the heap.
+         * Without memory, nothing is hidden.
+         */
+        heap_error_code_t error;
+        copy = (char **)os_raw_mem_alloc(NULL, ALIGN_FORWARD(size, PAGE_SIZE),
+                                         MEMPROT_READ | MEMPROT_WRITE, 0, &error);
+        if (copy == NULL)
+            return;
+    }
+
+    /* Choose AT_EXECFN's new storage before changing anything, if it is in a
+     * hidden entry.
+     */
+    for (i = 0; execfn != NULL && i < num_env; i++) {
+        if (env_entry_hidden_from_app(envp[i], prefixes) && execfn >= envp[i] &&
+            execfn <= envp[i] + strlen(envp[i])) {
+            execfn_entry = envp[i];
+            execfn_len = strlen(execfn) + 1;
+        }
+    }
+    if (execfn_len > 0) {
+        if (kernel_execfn != NULL && strlen(kernel_execfn) + 1 >= execfn_len)
+            execfn_target = kernel_execfn;
+        else {
+            /* A plain mapping, not added to DR's areas. */
+            heap_error_code_t error;
+            execfn_target =
+                (char *)os_raw_mem_alloc(NULL, ALIGN_FORWARD(execfn_len, PAGE_SIZE),
+                                         MEMPROT_READ | MEMPROT_WRITE, 0, &error);
+            /* The entry holds its name, '=' and the path, so the path fits. */
+            if (execfn_target == NULL)
+                execfn_target = execfn_entry;
+        }
+    }
+
+    copy_auxv = (ELF_AUXV_TYPE *)(copy + num_env + 1);
+    memcpy(copy_auxv, auxv, sizeof(ELF_AUXV_TYPE) * num_auxv);
+    strings = (char *)(copy_auxv + num_auxv);
+    for (i = 0; i < num_env; i++) {
+        if (env_entry_hidden_from_app(envp[i], prefixes)) {
+            size_t len = strlen(envp[i]) + 1;
+            memcpy(strings, envp[i], len);
+            copy[i] = strings;
+            if (execfn_len > 0 && execfn >= envp[i] && execfn < envp[i] + len)
+                execfn_copy = strings + (execfn - envp[i]);
+            strings += len;
+        } else
+            copy[i] = envp[i];
+    }
+    copy[num_env] = NULL;
+    our_environ = copy;
+    /* The private loader cached a pointer into the application's environment;
+     * the variable may be about to be erased.
+     */
+    ld_library_path = getenv(SYSTEM_LIBRARY_PATH_VAR);
+
+    dst = envp;
+    for (i = 0; i < num_env; i++) {
+        if (copy[i] != envp[i])
+            memset(envp[i], 0, strlen(envp[i]));
+        else
+            *dst++ = envp[i];
+    }
+    *dst = NULL;
+    memmove(dst + 1, auxv, sizeof(ELF_AUXV_TYPE) * num_auxv);
+    /* Clear the words the move vacated above the new AT_NULL. */
+    memset((byte *)(dst + 1) + sizeof(ELF_AUXV_TYPE) * num_auxv, 0,
+           (byte *)(auxv + num_auxv) -
+               ((byte *)(dst + 1) + sizeof(ELF_AUXV_TYPE) * num_auxv));
+    if (execfn_target != NULL) {
+        ELF_AUXV_TYPE *moved = (ELF_AUXV_TYPE *)(dst + 1);
+        /* The kernel's exec filename names DR's library; erase it whether or
+         * not it receives the application's path.
+         */
+        if (kernel_execfn != NULL)
+            memset(kernel_execfn, 0, strlen(kernel_execfn));
+        memcpy(execfn_target, execfn_copy, execfn_len);
+        for (j = 0; j < num_auxv; j++) {
+            if (moved[j].a_type == AT_EXECFN) {
+                moved[j].a_un.a_val = (ptr_uint_t)execfn_target;
+                copy_auxv[j].a_un.a_val = (ptr_uint_t)execfn_target;
+            }
+        }
+    }
+    app_env_hidden = true;
+}
+
 /* Called from _start in x86.asm.  sp is the initial app stack pointer that the
  * kernel set up for us, and it points to the usual argc, argv, envp, and auxv
  * that the kernel puts on the stack.  The 2nd & 3rd args must be 0 in
@@ -2193,6 +2584,7 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
     bool success;
     memquery_iter_t iter;
     app_pc interp_map;
+    char *kernel_execfn = NULL;
 
     if (*argc == ARGC_PTRACE_SENTINEL) {
         /* XXX: Teach the injector to look up takeover_ptrace() and call it
@@ -2377,6 +2769,20 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
         entry = (app_pc)exe_ld.ehdr->e_entry + exe_ld.load_delta;
     }
 
+    /* The kernel's exec filename, before privload_setup_auxv() repoints
+     * AT_EXECFN; privload_hide_app_env() reuses its storage.
+     */
+    {
+        char **env_end = envp;
+        ELF_AUXV_TYPE *entry;
+        while (*env_end != NULL)
+            env_end++;
+        for (entry = (ELF_AUXV_TYPE *)(env_end + 1); entry->a_type != AT_NULL;
+             entry++) {
+            if (entry->a_type == AT_EXECFN)
+                kernel_execfn = (char *)entry->a_un.a_val;
+        }
+    }
     privload_setup_auxv(envp, exe_map, exe_ld.load_delta, interp_map, exe_path);
 
     elf_loader_destroy(&exe_ld);
@@ -2399,6 +2805,8 @@ privload_early_inject(void **sp, byte *old_libdr_base, size_t old_libdr_size)
         }
         LOG(GLOBAL, LOG_TOP, 1, "\n");
     });
+
+    privload_hide_app_env(sp, kernel_execfn);
 
     if (RUNNING_WITHOUT_CODE_CACHE()) {
         /* Reset the stack pointer back to the beginning and jump to the entry

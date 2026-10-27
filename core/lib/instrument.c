@@ -255,6 +255,7 @@ static callback_list_t post_syscall_callbacks = {
 static callback_list_t kernel_xfer_callbacks = {
     0,
 };
+static callback_list_t cache_context_invalidation_callbacks = { 0 };
 #ifdef WINDOWS
 static callback_list_t exception_callbacks = {
     0,
@@ -263,6 +264,7 @@ static callback_list_t exception_callbacks = {
 static callback_list_t signal_callbacks = {
     0,
 };
+static callback_list_t signal_admission_callbacks = { 0 };
 #endif
 #ifdef PROGRAM_SHEPHERDING
 static callback_list_t security_violation_callbacks = {
@@ -874,10 +876,12 @@ free_all_callback_lists(void)
     free_callback_list(&pre_syscall_callbacks);
     free_callback_list(&post_syscall_callbacks);
     free_callback_list(&kernel_xfer_callbacks);
+    free_callback_list(&cache_context_invalidation_callbacks);
 #ifdef WINDOWS
     free_callback_list(&exception_callbacks);
 #else
     free_callback_list(&signal_callbacks);
+    free_callback_list(&signal_admission_callbacks);
 #endif
     free_callback_list(&clean_call_insertion_callbacks);
 #ifdef PROGRAM_SHEPHERDING
@@ -1273,6 +1277,25 @@ dr_unregister_signal_event(dr_signal_action_t (*func)(void *drcontext,
 {
     return remove_callback(&signal_callbacks, (void (*)(void))func, true);
 }
+
+bool
+dr_register_signal_admission_event(dr_signal_admission_cb_t func)
+{
+#if defined(LINUX) && defined(X86_64)
+    if (func == NULL || signal_admission_callbacks.num != 0)
+        return false;
+    add_callback(&signal_admission_callbacks, (void (*)(void))func, true);
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool
+dr_unregister_signal_admission_event(dr_signal_admission_cb_t func)
+{
+    return remove_callback(&signal_admission_callbacks, (void (*)(void))func, true);
+}
 #endif /* WINDOWS */
 
 void
@@ -1309,6 +1332,21 @@ bool
 dr_unregister_post_syscall_event(void (*func)(void *drcontext, int sysnum))
 {
     return remove_callback(&post_syscall_callbacks, (void (*)(void))func, true);
+}
+
+void
+dr_register_cache_context_invalidation_event(
+    void (*func)(void *drcontext, app_pc source_pc, app_pc target_pc))
+{
+    add_callback(&cache_context_invalidation_callbacks, (void (*)(void))func, true);
+}
+
+bool
+dr_unregister_cache_context_invalidation_event(
+    void (*func)(void *drcontext, app_pc source_pc, app_pc target_pc))
+{
+    return remove_callback(&cache_context_invalidation_callbacks, (void (*)(void))func,
+                           true);
 }
 
 void
@@ -2128,6 +2166,17 @@ instrument_invoke_another_syscall(dcontext_t *dcontext)
     return dcontext->client_data->invoke_another_syscall;
 }
 
+void
+instrument_cache_context_invalidated(dcontext_t *dcontext, app_pc source_pc,
+                                     app_pc target_pc)
+{
+    ASSERT_OWN_MUTEX(true, &thread_initexit_lock);
+    /* No cur_mc/os_cxt is installed: this is a read-only fact after replacement,
+     * not the mutable, before-transfer kernel_xfer contract. */
+    call_all(cache_context_invalidation_callbacks, int (*)(void *, app_pc, app_pc),
+             (void *)dcontext, source_pc, target_pc);
+}
+
 bool
 instrument_kernel_xfer(dcontext_t *dcontext, dr_kernel_xfer_type_t type,
                        os_cxt_ptr_t source_os_cxt, dr_mcontext_t *source_dmc,
@@ -2212,6 +2261,16 @@ bool
 dr_signal_hook_exists(void)
 {
     return (signal_callbacks.num > 0);
+}
+
+dr_signal_admission_status_t
+instrument_signal_admission(dcontext_t *dcontext, const dr_signal_admission_t *event,
+                            dr_mcontext_t *redirect)
+{
+    dr_signal_admission_status_t result = DR_SIGNAL_ADMISSION_BYPASS;
+    call_all_ret(result, =, , signal_admission_callbacks, dr_signal_admission_cb_t,
+                 (void *)dcontext, event, redirect);
+    return result;
 }
 #endif /* WINDOWS */
 
@@ -2801,6 +2860,12 @@ dr_get_process_id_from_drcontext(void *drcontext)
 }
 
 #ifdef UNIX
+DR_API bool
+dr_is_post_execve(void)
+{
+    return post_execve;
+}
+
 DR_API
 process_id_t
 dr_get_parent_id(void)
@@ -3481,6 +3546,47 @@ dr_memory_is_in_client(const byte *pc)
 {
     return is_in_client_lib((app_pc)pc);
 }
+
+DR_API
+size_t
+dr_get_private_reservations(dr_private_reservation_t *regions, size_t capacity)
+{
+    if (regions == NULL)
+        return 0;
+    byte *starts[PRIVATE_RESERVATION_CAPACITY];
+    size_t sizes[PRIVATE_RESERVATION_CAPACITY];
+    size_t count =
+        heap_private_reservations(starts, sizes, PRIVATE_RESERVATION_CAPACITY);
+    memset(regions, 0, MIN(capacity, DR_PRIVATE_RESERVATION_MAX) * sizeof(*regions));
+    if (count > capacity)
+        return 0;
+    for (size_t i = 0; i < count; ++i) {
+        regions[i].start = starts[i];
+        regions[i].size = sizes[i];
+    }
+    return count;
+}
+
+DR_API
+void
+dr_set_private_reservation_retirement_callback(void (*callback)(void))
+{
+    heap_set_private_reservation_retirement_callback(callback);
+}
+
+#ifdef LINUX
+DR_API bool
+dr_mapping_capture_stack(void *context, byte **start, size_t *size)
+{
+    dcontext_t *dcontext = (dcontext_t *)context;
+    if (dcontext == NULL || dcontext != get_thread_private_dcontext() ||
+        !is_currently_on_dstack(dcontext) || start == NULL || size == NULL)
+        return false;
+    *start = dcontext->dstack - DYNAMORIO_STACK_SIZE;
+    *size = DYNAMORIO_STACK_SIZE;
+    return true;
+}
+#endif
 
 void
 instrument_client_lib_loaded(byte *start, byte *end)

@@ -140,6 +140,11 @@ bool
 instrument_invoke_another_syscall(dcontext_t *dcontext);
 void
 instrument_low_on_memory(void);
+/* The target is stopped and lifetime-locked; its old raw continuation has
+ * already been successfully replaced.  Only copied scalar PCs are passed. */
+void
+instrument_cache_context_invalidated(dcontext_t *dcontext, app_pc source_pc,
+                                     app_pc target_pc);
 /* returns whether a client event was called which might have changed the context */
 bool
 instrument_kernel_xfer(dcontext_t *dcontext, dr_kernel_xfer_type_t type,
@@ -161,6 +166,9 @@ dr_signal_action_t
 instrument_signal(dcontext_t *dcontext, dr_siginfo_t *siginfo);
 bool
 dr_signal_hook_exists(void);
+dr_signal_admission_status_t
+instrument_signal_admission(dcontext_t *dcontext, const dr_signal_admission_t *event,
+                            dr_mcontext_t *redirect);
 #endif
 int
 get_num_client_threads(void);

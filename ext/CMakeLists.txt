@@ -138,40 +138,10 @@ macro(add_ext_asm_target asm_file_arm asm_file_aarch64 asm_file_riscv64 asm_file
 endmacro()
 
 add_subdirectory(drcontainers)
-if (NOT ANDROID AND NOT ARM AND NOT AARCH64)
-  # XXX i#1701: fails to build on Android.  May not be worth porting.
-  # XXX: fails when cross-compiling for ARM or A64 on a machine with x86 Qt5 installing.
-  # Working around that by just disabling for ARM and A64 completely.
-  add_subdirectory(drgui)
-endif ()
 add_subdirectory(drmgr)
 add_subdirectory(drx)
 add_subdirectory(drwrap)
 add_subdirectory(drreg)
-add_subdirectory(drbbdup)
-add_subdirectory(drsyms)
-add_subdirectory(drutil)
-add_subdirectory(droption)
-add_subdirectory(drcovlib)
-add_subdirectory(drstatecmp)
-add_subdirectory(drsyscall)
-if (BUILD_PT_TRACER)
-  add_subdirectory(drpttracer)
-endif (BUILD_PT_TRACER)
-if (LINUX) # TODO i#2414: Port to Windows, Mac, and Android.
-  if (HAVE_LIBUNWIND_H)
-    add_subdirectory(drcallstack)
-  else ()
-    # Require libunwind.h for automated testing.
-    # The TEST_SUITE var is set for packages too, to ensure we publish drcallstack.
-    # We do not install for Android nor a64-on-x86 in the suite.
-    if (TEST_SUITE AND NOT ANDROID AND NOT DR_HOST_NOT_TARGET)
-      message(FATAL_ERROR "libunwind-dev is required to build drcallstack")
-    else ()
-      message(STATUS "libunwind-dev package not installed: not building drcallstack")
-    endif ()
-  endif ()
-endif ()
 
 # documentation is put into main DR docs/ dir
 

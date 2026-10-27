@@ -802,4 +802,153 @@ DR_API
 bool
 dr_memory_is_in_client(const byte *pc);
 
+/** One interval of authenticated DynamoRIO-owned pages. */
+typedef struct _dr_private_reservation_t {
+    byte *start;
+    size_t size;
+} dr_private_reservation_t;
+
+/** Maximum number of canonical private ownership intervals. */
+#define DR_PRIVATE_RESERVATION_MAX 8
+
+DR_API
+/**
+ * Copies the canonical union of vmheap/vmcode reservations (including alignment
+ * padding and any writable alias) and the authenticated bootstrap image's actual
+ * page-rounded PT_LOAD memory extents, including BSS. Gaps are not inferred to
+ * be owned. Other allocations outside those owners are not included. Call during
+ * client initialization, before application execution. Returns zero if bootstrap
+ * metadata is unavailable/invalid or the complete union cannot fit; never returns
+ * an arena-only prefix. The bounded output is zeroed even on failure. Does not
+ * allocate or retain a lock. Bootstrap header storage accepts at most 128 PHDRs.
+ */
+size_t
+dr_get_private_reservations(dr_private_reservation_t *regions, size_t capacity);
+
+DR_API
+/**
+ * Installs one initialization-time observer of lost reservation authority.
+ * The callback runs before an application operation may replace/release any
+ * reservation, or before the heap manager releases a whole reservation.  It
+ * must not allocate, inject a syscall, or call back into DynamoRIO.  Internal
+ * commitment/protection changes do not notify it.  NULL removes the observer
+ * during client shutdown, before the client's code can be unloaded.
+ */
+void
+dr_set_private_reservation_retirement_callback(void (*callback)(void));
+
+#ifdef LINUX
+DR_API
+/**
+ * Installs one initialization-time observation of SDK birth attempts. Invoked
+ * before client-thread preparation or a raw stackdump fork, including failed
+ * attempts. The callback may only update preallocated atomic state: no DR call,
+ * syscall, allocation, wait or lock. A NULL entry denotes the raw fork path.
+ * Clear before the client is unloaded. This does not observe private-libc or
+ * arbitrary Tool births; those need the Tool's explicit ownership contract.
+ */
+void
+dr_set_mapping_capture_birth_observer(void (*callback)(void *parent_context,
+                                                       void (*entry)(void *), void *arg));
+
+/* Internal SDK birth sites call the same observer before their first effect. */
+void
+mapping_capture_observe_birth(void *parent_context, void (*entry)(void *), void *arg);
+
+/** Test observer kinds for the SDK paths used by the capture's native code.
+ * These are entry observations, including failed/retried requests, not a
+ * census of arbitrary libc/raw syscall activity. */
+typedef enum {
+    DR_MAPPING_CAPTURE_MEMORY_ALLOC,
+    DR_MAPPING_CAPTURE_MEMORY_FREE,
+    DR_MAPPING_CAPTURE_MEMORY_MAP,
+    DR_MAPPING_CAPTURE_MEMORY_PROTECT,
+} dr_mapping_capture_memory_kind_t;
+
+DR_API
+/** Private test instrumentation. Install before other client threads start and
+ * clear before unloading. The callback may only update preallocated atomics;
+ * it must not call DR, allocate, make syscalls, acquire locks or wait. Normal
+ * execution leaves it NULL. The client selects the exact observed interval. */
+void
+dr_set_mapping_capture_memory_observer(
+    void (*callback)(dr_mapping_capture_memory_kind_t kind));
+
+void
+mapping_capture_observe_memory(dr_mapping_capture_memory_kind_t kind);
+
+DR_API
+/**
+ * One fixed, nonallocating consistency check of the current DR registry. Tries
+ * initexit then registry locks once; no lock is retained. Requires exactly the
+ * current non-client context plus the named client context/TID, with no exec,
+ * initializing or exiting record. This corroborates a separate birth/Tool
+ * certificate; it is not a census of unmanaged native execution.
+ */
+bool
+dr_mapping_capture_registry(void *caller_context, void *helper_context,
+                             thread_id_t helper_tid);
+
+DR_API
+/** Private native test only: a client helper tries the actual registry lock
+ * once and releases that same lock before restoring its physical mask. */
+bool
+dr_mapping_capture_test_registry_lock(bool acquire);
+
+DR_API
+/** Current executor's complete DR stack, excluding guard pages. No allocation
+ * or lock; refuses a foreign context or an invocation not on that stack. */
+bool
+dr_mapping_capture_stack(void *context, byte **start, size_t *size);
+
+/** Closed set of internal runtime operations used by a prepared capture. */
+typedef enum {
+    DR_MAPPING_CAPTURE_SEND,
+    DR_MAPPING_CAPTURE_RECEIVE,
+    DR_MAPPING_CAPTURE_POLL,
+    DR_MAPPING_CAPTURE_CLOCK,
+    DR_MAPPING_CAPTURE_BLOCK_SIGNALS,
+    DR_MAPPING_CAPTURE_RESTORE_SIGNALS,
+    DR_MAPPING_CAPTURE_WAIT,
+    DR_MAPPING_CAPTURE_WAKE,
+    DR_MAPPING_CAPTURE_EXIT,
+    /* Physical signal observation and private native-control probes. These
+     * never enter the application syscall injector or change its mask model. */
+    DR_MAPPING_CAPTURE_QUERY_MASK,
+    DR_MAPPING_CAPTURE_PENDING,
+    DR_MAPPING_CAPTURE_TEST_SIGNAL,
+    DR_MAPPING_CAPTURE_TEST_TAKE_PENDING,
+    DR_MAPPING_CAPTURE_TEST_WRITE,
+    DR_MAPPING_CAPTURE_TEST_SHUTDOWN,
+} dr_mapping_capture_operation_t;
+
+DR_API
+/**
+ * Linux x86-64 raw runtime-control operations, never application injection.
+ * send/receive take fd, buffer, length; poll takes pollfd pointer and timeout
+ * milliseconds; clock takes a timespec pointer; mask operations take a pointer
+ * to one kernel 64-bit signal set; wait takes an aligned futex, expected value
+ * and relative timespec; wake takes the futex; exit takes the group exit code.
+ * All storage is caller-owned and prefaulted. Returns Linux's raw negative
+ * errno. No allocation, DR lock, app-mask update, restart or error formatting.
+ * send always uses DONTWAIT|NOSIGNAL, receive DONTWAIT, poll never swaps masks.
+ * Private test operations include bounded writes to the already-owned diagnostic
+ * FD and shutdown of the borrowed transport. There is no syscall-number API.
+ */
+ptr_int_t
+dr_mapping_capture_control(dr_mapping_capture_operation_t operation, ptr_uint_t a,
+                            ptr_uint_t b, ptr_uint_t c);
+#endif
+
+#ifdef UNIX
+DR_API
+/**
+ * Regression-test seam: invoke the production normalized-syscall ownership
+ * retirement path without executing a kernel syscall.  The installed observer
+ * may run; callers must use this only during isolated client initialization.
+ */
+void
+dr_test_private_reservation_syscall(int sysnum, const reg_t args[6]);
+#endif
+
 #endif /* _DR_OS_UTILS_H_ */

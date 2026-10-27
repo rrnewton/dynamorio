@@ -67,6 +67,31 @@
 
 extern bool vm_areas_exited;
 
+/* Set before application execution; cleared before the client is unloaded.
+ * The observer only withdraws a fixed ownership fact. It cannot call back into
+ * DR or allocate, and no DR lock is held on its behalf. */
+DECLARE_NEVERPROT_VAR(static void (*private_reservation_retirement)(void), NULL);
+/* The loader publishes only authenticated PT_LOAD pages. Keep this independent
+ * of loader metadata and locks: retirement can run during heap teardown. */
+DECLARE_NEVERPROT_VAR(static byte *bootstrap_private_starts[PRIVATE_RESERVATION_CAPACITY],
+                     { 0 });
+DECLARE_NEVERPROT_VAR(static size_t bootstrap_private_sizes[PRIVATE_RESERVATION_CAPACITY],
+                     { 0 });
+DECLARE_NEVERPROT_VAR(static size_t bootstrap_private_count, 0);
+
+void
+heap_set_private_reservation_retirement_callback(void (*callback)(void))
+{
+    private_reservation_retirement = callback;
+}
+
+void
+heap_retire_private_reservations(void)
+{
+    if (private_reservation_retirement != NULL)
+        private_reservation_retirement();
+}
+
 /***************************************************************************
  * we cannot use malloc in the middle of interpreting the client program
  * because we could be in the middle of interpreting malloc, which is not
@@ -1099,6 +1124,7 @@ vmm_heap_unit_exit(vm_heap_t *vmh)
 #endif
     if (free_heap) {
         heap_error_code_t error_code;
+        heap_retire_private_reservations();
         os_heap_free(vmh->alloc_start, vmh->alloc_size, &error_code);
         ASSERT(error_code == HEAP_ERROR_SUCCESS);
         if (DYNAMO_OPTION(satisfy_w_xor_x) && vmh == &heapmgt->vmcode) {
@@ -1299,6 +1325,120 @@ iterate_vmm_regions(void (*cb)(byte *region_start, byte *region_end, void *user_
               heapmgt->vmcode_writable_base +
                   (heapmgt->vmcode.end_addr - heapmgt->vmcode.start_addr),
               user_data);
+    }
+}
+
+void
+heap_set_bootstrap_private_segments(byte **starts, size_t *sizes, size_t count)
+{
+    heap_retire_private_reservations();
+    bootstrap_private_count = 0;
+    memset(bootstrap_private_starts, 0, sizeof(bootstrap_private_starts));
+    memset(bootstrap_private_sizes, 0, sizeof(bootstrap_private_sizes));
+    if (starts == NULL || sizes == NULL || count == 0 ||
+        count > PRIVATE_RESERVATION_CAPACITY)
+        return;
+    for (size_t i = 0; i < count; ++i) {
+        if (sizes[i] == 0 || (ptr_uint_t)starts[i] > POINTER_MAX - sizes[i] ||
+            (i > 0 && (ptr_uint_t)starts[i - 1] + sizes[i - 1] >=
+                 (ptr_uint_t)starts[i]))
+            return;
+    }
+    memcpy(bootstrap_private_starts, starts, count * sizeof(*starts));
+    memcpy(bootstrap_private_sizes, sizes, count * sizeof(*sizes));
+    bootstrap_private_count = count;
+}
+
+size_t
+heap_private_reservations(byte **starts, size_t *sizes, size_t capacity)
+{
+    if (starts == NULL || sizes == NULL)
+        return 0;
+    size_t output_capacity = MIN(capacity, PRIVATE_RESERVATION_CAPACITY);
+    memset(starts, 0, output_capacity * sizeof(*starts));
+    memset(sizes, 0, output_capacity * sizeof(*sizes));
+    if (heapmgt == NULL || bootstrap_private_count == 0)
+        return 0;
+    /* The final union, not an input prefix, is subject to the wire bound. */
+    byte *all_starts[PRIVATE_RESERVATION_CAPACITY + 3];
+    size_t all_sizes[PRIVATE_RESERVATION_CAPACITY + 3];
+    size_t count = bootstrap_private_count;
+    memcpy(all_starts, bootstrap_private_starts, count * sizeof(*starts));
+    memcpy(all_sizes, bootstrap_private_sizes, count * sizeof(*sizes));
+    if (heapmgt->vmheap.alloc_start != NULL) {
+        all_starts[count] = heapmgt->vmheap.alloc_start;
+        all_sizes[count++] = heapmgt->vmheap.alloc_size;
+    }
+    if (heapmgt->vmcode.alloc_start != NULL) {
+        all_starts[count] = heapmgt->vmcode.alloc_start;
+        all_sizes[count++] = heapmgt->vmcode.alloc_size;
+    }
+    if (heapmgt->vmcode_writable_alloc != NULL) {
+        all_starts[count] = heapmgt->vmcode_writable_alloc;
+        all_sizes[count++] = heapmgt->vmcode.alloc_size;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (all_sizes[i] == 0 ||
+            (ptr_uint_t)all_starts[i] > POINTER_MAX - all_sizes[i])
+            return 0;
+    }
+    for (size_t i = 1; i < count; ++i) {
+        byte *start = all_starts[i];
+        size_t size = all_sizes[i];
+        size_t j = i;
+        while (j > 0 && (ptr_uint_t)all_starts[j - 1] > (ptr_uint_t)start) {
+            all_starts[j] = all_starts[j - 1];
+            all_sizes[j] = all_sizes[j - 1];
+            --j;
+        }
+        all_starts[j] = start;
+        all_sizes[j] = size;
+    }
+    size_t merged = 0;
+    for (size_t i = 0; i < count; ++i) {
+        ptr_uint_t end = (ptr_uint_t)all_starts[i] + all_sizes[i];
+        if (merged > 0 && (ptr_uint_t)all_starts[i] <=
+                (ptr_uint_t)all_starts[merged - 1] + all_sizes[merged - 1]) {
+            ptr_uint_t old_end =
+                (ptr_uint_t)all_starts[merged - 1] + all_sizes[merged - 1];
+            if (end > old_end)
+                all_sizes[merged - 1] = end - (ptr_uint_t)all_starts[merged - 1];
+        } else {
+            all_starts[merged] = all_starts[i];
+            all_sizes[merged++] = all_sizes[i];
+        }
+    }
+    if (merged > output_capacity)
+        return 0;
+    memcpy(starts, all_starts, merged * sizeof(*starts));
+    memcpy(sizes, all_sizes, merged * sizeof(*sizes));
+    return merged;
+}
+
+void
+heap_retire_private_reservation_overlap(byte *start, size_t size)
+{
+    if (private_reservation_retirement == NULL || size == 0)
+        return;
+    ptr_uint_t lo = (ptr_uint_t)start;
+    if (lo > POINTER_MAX - size) {
+        heap_retire_private_reservations();
+        return;
+    }
+    byte *starts[PRIVATE_RESERVATION_CAPACITY];
+    size_t sizes[PRIVATE_RESERVATION_CAPACITY];
+    size_t count =
+        heap_private_reservations(starts, sizes, PRIVATE_RESERVATION_CAPACITY);
+    if (count == 0) {
+        heap_retire_private_reservations();
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (lo < (ptr_uint_t)starts[i] + sizes[i] &&
+            (ptr_uint_t)starts[i] < lo + size) {
+            heap_retire_private_reservations();
+            return;
+        }
     }
 }
 
@@ -2679,11 +2819,21 @@ heap_reserve_for_external_mapping(byte *preferred, size_t size, which_vmm_t whic
 #endif
     vm_addr_t p = NULL;
     vm_heap_t *vmh = vmheap_for_which(which);
-    ASSERT(size > 0);
-    size = ALIGN_FORWARD(size, PAGE_SIZE);
-    if (!DYNAMO_OPTION(vm_reserve))
+    /* This is also used before the general heap is initialized.  The VMM's
+     * actual reservation and bitmap, not that later phase, establish readiness.
+     * Refuse before either alignment can wrap or a block count can truncate. */
+    if (!DYNAMO_OPTION(vm_reserve) || vmh->blocks == NULL ||
+        vmh->start_addr == NULL || vmh->end_addr <= vmh->start_addr || size == 0 ||
+        size > (size_t)-1 - (PAGE_SIZE - 1))
         return NULL;
-    if (preferred >= vmh->start_addr && preferred + size <= vmh->end_addr)
+    size = ALIGN_FORWARD(size, PAGE_SIZE);
+    if (size > (size_t)-1 - (DYNAMO_OPTION(vmm_block_size) - 1) ||
+        ALIGN_FORWARD(size, DYNAMO_OPTION(vmm_block_size)) >
+            (size_t)(vmh->end_addr - vmh->start_addr))
+        return NULL;
+    if (preferred >= vmh->start_addr && preferred < vmh->end_addr &&
+        size <= (size_t)(vmh->end_addr - preferred) &&
+        ALIGNED((preferred - vmh->start_addr), DYNAMO_OPTION(vmm_block_size)))
         p = vmm_heap_reserve_blocks(vmh, size, preferred, which);
     if (p == NULL)
         p = vmm_heap_reserve_blocks(vmh, size, NULL, which);
@@ -3326,7 +3476,8 @@ d_r_map_file(file_t f, size_t *size DR_PARAM_INOUT, uint64 offs, app_pc addr, ui
     /* memory alloc/dealloc and updating DR list must be atomic */
     dynamo_vm_areas_lock(); /* if already hold lock this is a nop */
     view = os_map_file(f, size, offs, addr, prot, map_flags);
-    if (view != NULL) {
+    if (view != NULL &&
+        !TESTALL(MAP_FILE_PRIVATE_VMM | MAP_FILE_VMM_COMMIT, map_flags)) {
         STATS_ADD_PEAK(file_map_capacity, *size);
         account_for_memory((void *)view, *size, prot, true /*add now*/,
                            true /*image*/
@@ -4184,6 +4335,7 @@ heap_unit_extend_commitment(heap_unit_t *u, size_t size_need, uint prot)
 static void *
 common_heap_alloc(thread_units_t *tu, size_t size HEAPACCT(which_heap_t which))
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_ALLOC));
     heap_unit_t *u = tu->cur_unit;
     heap_pc p = NULL;
     int bucket = 0;
@@ -4509,6 +4661,7 @@ static bool
 common_heap_free(thread_units_t *tu, void *p_void,
                  size_t size HEAPACCT(which_heap_t which))
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_FREE));
     int bucket = 0;
     heap_pc p = (heap_pc)p_void;
 #if defined(DEBUG) && (defined(DEBUG_MEMORY) || defined(HEAP_ACCOUNTING))

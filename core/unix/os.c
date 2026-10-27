@@ -686,8 +686,11 @@ disable_env(const char *name)
              * up access to auxv, which is after the env block, so we instead
              * disable the env var by changing its name.
              * We keep going to handle later matches.
+             * Erase the rest of the entry too: the application can read it.
              */
-            snprintf(*env, name_len, "__disabled__");
+            size_t entry_len = strlen(*env);
+            snprintf(*env, name_len, DYNAMORIO_DISABLED_ENV);
+            memset(*env + strlen(*env), 0, entry_len - strlen(*env));
         }
         env++;
     }
@@ -718,6 +721,44 @@ our_getenv(const char *name)
         }
     }
     return NULL;
+}
+
+/* True if early injection hides the "NAME=value" entry from the application:
+ * every DR variable (including what disable_env() leaves of one), plus every
+ * variable whose name starts with one of the ':'-separated extra_prefixes (NULL
+ * for none).
+ */
+bool
+env_entry_hidden_from_app(const char *entry, const char *extra_prefixes)
+{
+    const char *prefix = extra_prefixes;
+    if (strncmp(entry, DYNAMORIO_VAR_PREFIX, strlen(DYNAMORIO_VAR_PREFIX)) == 0)
+        return true;
+    while (prefix != NULL && *prefix != '\0') {
+        const char *end = strchr(prefix, ':');
+        size_t len = end == NULL ? strlen(prefix) : (size_t)(end - prefix);
+        if (len > 0 && strncmp(entry, prefix, len) == 0)
+            return true;
+        prefix = end == NULL ? NULL : end + 1;
+    }
+    return false;
+}
+
+/* Set by privload_hide_app_env(). */
+bool app_env_hidden;
+
+/* Index of the entry in envp[0..num) naming the same variable as entry, or -1. */
+static int
+find_env_entry(char **envp, int num, const char *entry)
+{
+    const char *eq = strchr(entry, '=');
+    size_t name_len = eq == NULL ? strlen(entry) : (size_t)(eq - entry);
+    int i;
+    for (i = 0; i < num; i++) {
+        if (strncmp(envp[i], entry, name_len) == 0 && envp[i][name_len] == '=')
+            return i;
+    }
+    return -1;
 }
 
 bool
@@ -3533,6 +3574,7 @@ dr_raw_brk(void *new_address)
 void
 os_heap_free(void *p, size_t size, heap_error_code_t *error_code)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_MAP));
     long rc;
     ASSERT(error_code != NULL);
     if (!dynamo_exited)
@@ -3555,6 +3597,7 @@ void *
 os_heap_reserve(void *preferred, size_t size, heap_error_code_t *error_code,
                 bool executable)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_MAP));
     void *p;
     uint prot = PROT_NONE;
 #ifdef VMX86_SERVER
@@ -3732,6 +3775,7 @@ os_heap_reserve_in_region(void *start, void *end, size_t size,
 bool
 os_heap_commit(void *p, size_t size, uint prot, heap_error_code_t *error_code)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_PROTECT));
     uint os_prot = memprot_to_osprot(prot);
     long res;
     /* should only be used on aligned pieces */
@@ -3757,6 +3801,7 @@ os_heap_commit(void *p, size_t size, uint prot, heap_error_code_t *error_code)
 void
 os_heap_decommit(void *p, size_t size, heap_error_code_t *error_code)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_PROTECT));
     ASSERT(error_code != NULL);
 
     if (!dynamo_exited)
@@ -4255,6 +4300,85 @@ dynamorio_clone_macos(uint flags, byte *newsp, void *ptid, void *tls, void *ctid
  *   the thread is auto-terminated and stack cleaned up on return from run
  *   function
  */
+#ifdef LINUX
+DECLARE_NEVERPROT_VAR(static void (*mapping_capture_birth_observer)(
+                         void *, void (*)(void *), void *), NULL);
+DECLARE_NEVERPROT_VAR(static void (*mapping_capture_memory_observer)(
+                         dr_mapping_capture_memory_kind_t), NULL);
+
+DR_API void
+dr_set_mapping_capture_memory_observer(
+    void (*callback)(dr_mapping_capture_memory_kind_t))
+{
+    mapping_capture_memory_observer = callback;
+}
+
+void
+mapping_capture_observe_memory(dr_mapping_capture_memory_kind_t kind)
+{
+    if (mapping_capture_memory_observer != NULL)
+        mapping_capture_memory_observer(kind);
+}
+
+DR_API void
+dr_set_mapping_capture_birth_observer(void (*callback)(void *, void (*)(void *), void *))
+{
+    mapping_capture_birth_observer = callback;
+}
+
+void
+mapping_capture_observe_birth(void *parent_context, void (*entry)(void *), void *arg)
+{
+    if (mapping_capture_birth_observer != NULL)
+        mapping_capture_birth_observer(parent_context, entry, arg);
+}
+
+DR_API ptr_int_t
+dr_mapping_capture_control(dr_mapping_capture_operation_t operation, ptr_uint_t a,
+                            ptr_uint_t b, ptr_uint_t c)
+{
+#    ifdef X64
+    switch (operation) {
+    case DR_MAPPING_CAPTURE_SEND:
+        return dynamorio_syscall(SYS_sendto, 6, a, b, c, 0x40 | 0x4000, 0, 0);
+    case DR_MAPPING_CAPTURE_RECEIVE:
+        return dynamorio_syscall(SYS_recvfrom, 6, a, b, c, 0x40, 0, 0);
+    case DR_MAPPING_CAPTURE_POLL:
+        return dynamorio_syscall(SYS_poll, 3, a, 1, b);
+    case DR_MAPPING_CAPTURE_CLOCK:
+        return dynamorio_syscall(SYS_clock_gettime, 2, 1 /* CLOCK_MONOTONIC */, a);
+    case DR_MAPPING_CAPTURE_BLOCK_SIGNALS: {
+        uint64 mask = ~(uint64)0;
+        return dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, &mask, a, 8);
+    }
+    case DR_MAPPING_CAPTURE_RESTORE_SIGNALS:
+        return dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, a, 0, 8);
+    case DR_MAPPING_CAPTURE_WAIT:
+        return dynamorio_syscall(SYS_futex, 6, a, 0 /* FUTEX_WAIT */, b, c, 0, 0);
+    case DR_MAPPING_CAPTURE_WAKE:
+        return dynamorio_syscall(SYS_futex, 6, a, 1 /* FUTEX_WAKE */, 1, 0, 0, 0);
+    case DR_MAPPING_CAPTURE_EXIT:
+        return dynamorio_syscall(SYS_exit_group, 1, a);
+    case DR_MAPPING_CAPTURE_QUERY_MASK:
+        return dynamorio_syscall(SYS_rt_sigprocmask, 4, SIG_SETMASK, 0, a, 8);
+    case DR_MAPPING_CAPTURE_PENDING:
+        return dynamorio_syscall(SYS_rt_sigpending, 2, a, 8);
+    case DR_MAPPING_CAPTURE_TEST_SIGNAL:
+        return dynamorio_syscall(SYS_tgkill, 3, a, b, c);
+    case DR_MAPPING_CAPTURE_TEST_TAKE_PENDING: {
+        const struct timespec timeout = { 0, 0 };
+        return dynamorio_syscall(SYS_rt_sigtimedwait, 4, a, b, &timeout, 8);
+    }
+    case DR_MAPPING_CAPTURE_TEST_WRITE:
+        return dynamorio_syscall(SYS_write, 3, a, b, c);
+    case DR_MAPPING_CAPTURE_TEST_SHUTDOWN:
+        return dynamorio_syscall(SYS_shutdown, 2, a, b);
+    }
+#    endif
+    return -ENOSYS;
+}
+#endif
+
 DR_API bool
 dr_create_client_thread(void (*func)(void *param), void *arg)
 {
@@ -4271,6 +4395,7 @@ dr_create_client_thread(void (*func)(void *param), void *arg)
         CLONE_SIGHAND
             /* CLONE_THREAD required.  Signals and itimers are private anyway. */
             IF_VMX86(| (os_in_vmkernel_userworld() ? CLONE_THREAD : 0));
+    IF_LINUX(mapping_capture_observe_birth(dcontext, func, arg));
     pre_second_thread();
     /* need to share signal handler table, prior to creating clone record */
     handle_clone(dcontext, flags);
@@ -4734,8 +4859,57 @@ byte *
 os_map_file(file_t f, size_t *size DR_PARAM_INOUT, uint64 offs, app_pc addr, uint prot,
             map_flags_t map_flags)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_MAP));
     int flags;
     byte *map = NULL;
+#ifdef LINUX
+    if (TEST(MAP_FILE_PRIVATE_VMM, map_flags)) {
+        if (TEST(MAP_FILE_VMM_COMMIT, map_flags)) {
+            /* The loader checks the exact live image claim before this call.
+             * Arena membership here is an additional mechanism check only. */
+            if (!TEST(MAP_FILE_FIXED, map_flags) || addr == NULL || *size == 0 ||
+                *size > (ptr_uint_t)-1 - (ptr_uint_t)addr ||
+                !is_vmm_reserved_address(addr, *size, NULL, NULL)) {
+                SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                     "private image VMM commit has invalid bounds");
+                return NULL;
+            }
+        } else {
+            if (!DYNAMO_OPTION(vm_reserve) || DYNAMO_OPTION(satisfy_w_xor_x)) {
+                SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                     "private image VMM requires vm_reserve without "
+                                      "satisfy_w_xor_x");
+                return NULL;
+            }
+            if (f != INVALID_FILE || offs != 0 || prot != MEMPROT_NONE ||
+                TESTANY(MAP_FILE_FIXED | MAP_FILE_APP, map_flags)) {
+                SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                     "private image VMM reservation has invalid flags");
+                return NULL;
+            }
+            byte *reserved = heap_reserve_for_external_mapping(
+                addr, *size, VMM_SPECIAL_MMAP | VMM_REACHABLE);
+            if (reserved == NULL) {
+                SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                     "private image VMM unavailable or exhausted");
+                return NULL; /* Never spill into the application's mmap space. */
+            }
+            /* Linux heap decommit leaves the old pages/protection in place.
+             * Normalize this exact owned allocation before using its BSS/guard.
+             * A failed MAP_FIXED may have removed pages: retain the claim and
+             * terminate without attempting a destructive restoration or free. */
+            map = mmap_syscall(reserved, *size, PROT_NONE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (map != reserved) {
+                SYSLOG_CUSTOM_NOTIFY(SYSLOG_ERROR, 0, 0,
+                                     "private image VMM ownership indeterminate after "
+                                      "initial normalization failure");
+                os_terminate(NULL, TERMINATE_PROCESS);
+            }
+            return map;
+        }
+    }
+#endif
 #if defined(X64)
     bool loop = false;
     uint iters = 0;
@@ -4831,6 +5005,7 @@ os_map_file(file_t f, size_t *size DR_PARAM_INOUT, uint64 offs, app_pc addr, uin
 bool
 os_unmap_file(byte *map, size_t size)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_MAP));
     if (DYNAMO_OPTION(vm_reserve) && is_vmm_reserved_address(map, size, NULL, NULL)) {
         /* XXX i#3570: We'd prefer to have the VMM perform this to ensure it matches
          * how it originally reserved the memory.  To do that would we expose a way
@@ -4838,7 +5013,7 @@ os_unmap_file(byte *map, size_t size)
          */
         byte *addr = mmap_syscall(map, size, PROT_NONE,
                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (!mmap_syscall_succeeded(addr))
+        if (addr != map)
             return false;
         return heap_unreserve_for_external_mapping(map, size,
                                                    VMM_SPECIAL_MMAP | VMM_REACHABLE);
@@ -5209,6 +5384,7 @@ os_set_protection(byte *pc, size_t length, uint prot /*MEMPROT_*/)
 bool
 set_protection(byte *pc, size_t length, uint prot /*MEMPROT_*/)
 {
+    IF_LINUX(mapping_capture_observe_memory(DR_MAPPING_CAPTURE_MEMORY_PROTECT));
     if (os_set_protection(pc, length, prot) == false)
         return false;
 #ifndef HAVE_MEMINFO_QUERY
@@ -5925,6 +6101,11 @@ dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
     va_end(ap);
     MCXT_SYSNUM_REG(mc) = sysnum;
     reg_t res;
+#ifdef LINUX
+    uint saved_purpose = dcontext->client_data->returning_syscall_purpose;
+    dcontext->client_data->returning_syscall_purpose =
+        DR_SYSCALL_INJECTION_APPLICATION;
+#endif
     /* Skip client syscall events. */
     dcontext->client_data->skip_client_syscall_events = true;
     if (!pre_system_call(dcontext)) {
@@ -5932,7 +6113,9 @@ dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
     } else {
         res = dynamorio_syscall(sysnum, arg_count, args[0], args[1], args[2], args[3],
                                 args[4], args[5]);
+        MCXT_SYSCALL_RES(mc) = res;
         post_system_call(dcontext);
+        res = MCXT_SYSCALL_RES(mc);
     }
     dcontext->client_data->skip_client_syscall_events = false;
     /* Restore app registers. */
@@ -5941,8 +6124,147 @@ dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
     }
     MCXT_SYSCALL_RES(mc) = saved_res;
     MCXT_SYSNUM_REG(mc) = saved_sysnum;
+#ifdef LINUX
+    dcontext->client_data->returning_syscall_purpose = saved_purpose;
+#endif
     return res;
 }
+
+#ifdef LINUX
+static dr_syscall_invoke_status_t
+invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
+                                  const reg_t *args, int guest_process_id,
+                                  bool guard_shared_vm,
+                                  dr_syscall_injection_purpose_t purpose,
+                                  dr_syscall_invoke_result_t *result)
+{
+    dcontext_t *dcontext = (dcontext_t *)drcontext;
+    if (dcontext == NULL || dcontext == GLOBAL_DCONTEXT ||
+        dcontext != get_thread_private_dcontext() || result == NULL ||
+        arg_count < 0 || arg_count > 6 || (arg_count != 0 && args == NULL))
+        return DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED;
+    if (purpose != DR_SYSCALL_INJECTION_APPLICATION &&
+        purpose != DR_SYSCALL_INJECTION_PSELECT6_WRAPPER_VALIDATION)
+        return DR_SYSCALL_INVOKE_PURPOSE_REFUSED;
+    priv_mcontext_t *mc = get_mcontext(dcontext);
+    bool suspend = sysnum == SYS_rt_sigsuspend;
+    if (!signal_injection_permitted(dcontext, sysnum))
+        return DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED;
+    if (suspend && (!dcontext->client_data->in_pre_syscall ||
+                    !signal_begin_injected_sigsuspend(dcontext)))
+        return DR_SYSCALL_INVOKE_OWNERSHIP_REFUSED;
+
+    reg_t saved_args[6], actual_args[6] = { 0 };
+    reg_t saved_sysnum = MCXT_SYSNUM_REG(mc), saved_result = MCXT_SYSCALL_RES(mc);
+    int saved_number = dcontext->sys_num;
+    reg_t saved_params[5] = { dcontext->sys_param0, dcontext->sys_param1,
+                             dcontext->sys_param2, dcontext->sys_param3,
+                             dcontext->sys_param4 };
+    uint saved_purpose = dcontext->client_data->returning_syscall_purpose;
+    dcontext->client_data->returning_syscall_purpose = purpose;
+    bool saved_skip = dcontext->client_data->skip_client_syscall_events;
+    bool shared_vm_refused = false;
+    bool *saved_guard = dcontext->client_data->returning_shared_vm_refused;
+    dcontext->client_data->returning_shared_vm_refused =
+        guard_shared_vm ? &shared_vm_refused : NULL;
+    for (int i = 0; i < 6; ++i) {
+        saved_args[i] = sys_param(dcontext, i);
+        if (i < arg_count)
+            set_syscall_param(dcontext, i, args[i]);
+    }
+    MCXT_SYSNUM_REG(mc) = sysnum;
+    dcontext->client_data->skip_client_syscall_events = true;
+    result->interruption = 0;
+    if (pre_system_call(dcontext)) {
+        /* Prehandling owns argument substitutions (including private masks).
+         * Executing the original varargs here bypasses those substitutions. */
+        for (int i = 0; i < arg_count; ++i)
+            actual_args[i] = sys_param(dcontext, i);
+#    ifdef X86_64
+        bool sigpipe = signal_begin_injected_sigpipe(dcontext, dcontext->sys_num,
+                                                     guest_process_id);
+        if (sigpipe) {
+            result->value = dynamorio_sigpipe_syscall(dcontext->sys_num, actual_args);
+            signal_end_injected_sigpipe(dcontext);
+        } else
+#    endif
+            result->value = suspend ? signal_wait_injected_sigsuspend(dcontext)
+                                    : dynamorio_syscall(dcontext->sys_num, arg_count,
+                                                        actual_args[0], actual_args[1],
+                                                        actual_args[2], actual_args[3],
+                                                        actual_args[4], actual_args[5]);
+        MCXT_SYSCALL_RES(mc) = result->value;
+        post_system_call(dcontext);
+    }
+    result->value = MCXT_SYSCALL_RES(mc);
+    if (suspend)
+        signal_finish_injected_sigsuspend(dcontext, result);
+    /* Later post-hook injections must not inherit this injection's DR syscall
+     * metadata. Its suspended signal state is separately owned by the token. */
+    dcontext->client_data->skip_client_syscall_events = saved_skip;
+    dcontext->sys_num = saved_number;
+    dcontext->sys_param0 = saved_params[0];
+    dcontext->sys_param1 = saved_params[1];
+    dcontext->sys_param2 = saved_params[2];
+    dcontext->sys_param3 = saved_params[3];
+    dcontext->sys_param4 = saved_params[4];
+    for (int i = 0; i < 6; ++i)
+        set_syscall_param(dcontext, i, saved_args[i]);
+    MCXT_SYSCALL_RES(mc) = saved_result;
+    MCXT_SYSNUM_REG(mc) = saved_sysnum;
+    dcontext->client_data->returning_shared_vm_refused = saved_guard;
+    dcontext->client_data->returning_syscall_purpose = saved_purpose;
+    if (shared_vm_refused) {
+        result->value = 0;
+        result->interruption = 0;
+        return DR_SYSCALL_INVOKE_SHARED_VM_REFUSED;
+    }
+    return DR_SYSCALL_INVOKE_COMPLETED;
+}
+
+DR_API
+bool
+dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
+                                    const reg_t *args,
+                                    dr_syscall_invoke_result_t *result)
+{
+    return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args, 0,
+                                             false, DR_SYSCALL_INJECTION_APPLICATION, result) ==
+        DR_SYSCALL_INVOKE_COMPLETED;
+}
+
+DR_API
+bool
+dr_invoke_syscall_as_app_with_result_and_sigpipe_identity(
+    void *drcontext, int sysnum, int arg_count, const reg_t *args,
+    int guest_process_id, dr_syscall_invoke_result_t *result)
+{
+    return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args,
+                                             guest_process_id, false, DR_SYSCALL_INJECTION_APPLICATION, result) ==
+        DR_SYSCALL_INVOKE_COMPLETED;
+}
+
+DR_API
+dr_syscall_invoke_status_t
+dr_invoke_syscall_as_app_with_shared_vm_guard(
+    void *drcontext, int sysnum, int arg_count, const reg_t *args,
+    int guest_process_id, dr_syscall_invoke_result_t *result)
+{
+    return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args,
+                                             guest_process_id, true, DR_SYSCALL_INJECTION_APPLICATION, result);
+}
+DR_API
+dr_syscall_invoke_status_t
+dr_invoke_syscall_as_app_with_purpose(
+    void *drcontext, int sysnum, int arg_count, const reg_t *args,
+    int guest_process_id, bool guard_shared_vm, dr_syscall_injection_purpose_t purpose,
+    dr_syscall_invoke_result_t *result)
+{
+    return invoke_syscall_as_app_with_result(drcontext, sysnum, arg_count, args,
+                                             guest_process_id, guard_shared_vm,
+                                             purpose, result);
+}
+#endif
 
 static inline bool
 is_thread_create_syscall_helper(ptr_uint_t sysnum, uint64 flags)
@@ -6088,6 +6410,45 @@ static const char *const env_to_propagate[] = {
 };
 #define NUM_ENV_TO_PROPAGATE (sizeof(env_to_propagate) / sizeof(env_to_propagate[0]))
 
+/* Whether add_dr_env_vars() itself sets entry's variable in a followed child's
+ * environment, given its need_var[] decisions.
+ */
+static bool
+dr_sets_env_at_execve(const char *entry, const bool *need_var)
+{
+    size_t len = strlen(DYNAMORIO_VAR_EXECVE);
+    int j;
+    if (strncmp(entry, DYNAMORIO_VAR_EXECVE, len) == 0 && entry[len] == '=')
+        return true;
+    for (j = 0; j < NUM_ENV_TO_PROPAGATE; j++) {
+        len = strlen(env_to_propagate[j]);
+        if (strncmp(entry, env_to_propagate[j], len) == 0 && entry[len] == '=') {
+            return need_var[j] &&
+                (DYNAMO_OPTION(follow_children) || j == ENV_PROP_EXE_PATH);
+        }
+    }
+    return false;
+}
+
+/* Whether an injected child's environment also gets source[index], one of the
+ * variables early injection hid from this application. The application's
+ * environment no longer carries them, so DR passes on each one it does not set
+ * itself (its configuration directory and other controls, the launcher's
+ * prefixed variables and the prefix list), the first entry of each name only,
+ * and the child's DR hides them again. An entry with no '=' (such as what
+ * disable_env() leaves of a variable) stays behind.
+ */
+static bool
+is_hidden_env_to_propagate(char **source, int index, const char *prefixes,
+                           const bool *need_var)
+{
+    const char *entry = source[index];
+    return app_env_hidden && strchr(entry, '=') != NULL &&
+        env_entry_hidden_from_app(entry, prefixes) &&
+        !dr_sets_env_at_execve(entry, need_var) &&
+        find_env_entry(source, index, entry) < 0;
+}
+
 /* Called at pre-SYS_execve to append DR vars in the target process env vars list.
  * For late injection via libdrpreload, we call this for *all children, because
  * even if -no_follow_children is specified, a allowlist will still ask for takeover
@@ -6098,7 +6459,8 @@ static const char *const env_to_propagate[] = {
  * config dir takes precedence (if the child clears the HOME env var, e.g.).
  */
 static void
-add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app_path)
+add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app_path,
+                bool injects)
 {
     char **envp = (char **)sys_param(dcontext, 2);
     int idx, j, preload = -1, ldpath = -1;
@@ -6107,6 +6469,15 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
     int prop_idx[NUM_ENV_TO_PROPAGATE];
     bool ldpath_us = false, preload_us = false;
     char **new_envp, *var, *old;
+    const char *hide_prefixes;
+    /* Per our_environ entry: HIDDEN_SKIP, HIDDEN_APPEND, or the application
+     * slot it replaces. Decided once, so the count and the fill agree even if
+     * the application changes its environment meanwhile.
+     */
+    int *hidden_slot = NULL;
+    int num_private = 0;
+#define HIDDEN_SKIP -2
+#define HIDDEN_APPEND -1
 
     /* check if any var needs to be propagated */
     for (j = 0; j < NUM_ENV_TO_PROPAGATE; j++) {
@@ -6136,7 +6507,12 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
             /* execve env vars should never be set here */
             ASSERT(strstr(envp[idx], DYNAMORIO_VAR_EXECVE) != envp[idx]);
             for (j = 0; j < NUM_ENV_TO_PROPAGATE; j++) {
-                if (strstr(envp[idx], env_to_propagate[j]) == envp[idx]) {
+                /* Match the whole name: a longer variable sharing the prefix
+                 * (DYNAMORIO_EXE_PATH_X) is not this one.
+                 */
+                size_t name_len = strlen(env_to_propagate[j]);
+                if (strncmp(envp[idx], env_to_propagate[j], name_len) == 0 &&
+                    envp[idx][name_len] == '=') {
                     /* If conflict between env and cfg, we assume those env vars
                      * are for DR usage only, and replace them with cfg value.
                      */
@@ -6173,6 +6549,36 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
         (DYNAMO_OPTION(early_inject)
              ? 0
              : (((preload < 0) ? 1 : 0) + ((ldpath < 0) ? 1 : 0)));
+    hide_prefixes = getenv(DYNAMORIO_VAR_HIDE_ENV_PREFIXES);
+    if (injects && app_env_hidden) {
+        while (our_environ[num_private] != NULL)
+            num_private++;
+        hidden_slot = (int *)heap_alloc(
+            dcontext, sizeof(int) * (num_private + 1) HEAPACCT(ACCT_OTHER));
+        for (j = 0; j < num_private; j++) {
+            int slot, k;
+            if (!is_hidden_env_to_propagate(our_environ, j, hide_prefixes, need_var)) {
+                hidden_slot[j] = HIDDEN_SKIP;
+                continue;
+            }
+            slot = envp == NULL ? -1 : find_env_entry(envp, num_old, our_environ[j]);
+            /* Never a slot DR's own variables replace, nor one an earlier
+             * hidden variable already took.
+             */
+            for (k = 0; slot >= 0 && k < NUM_ENV_TO_PROPAGATE; k++) {
+                if (prop_idx[k] == slot && need_var[k] &&
+                    (DYNAMO_OPTION(follow_children) || k == ENV_PROP_EXE_PATH))
+                    slot = -1;
+            }
+            for (k = 0; slot >= 0 && k < j; k++) {
+                if (hidden_slot[k] == slot)
+                    slot = -1;
+            }
+            hidden_slot[j] = slot < 0 ? HIDDEN_APPEND : slot;
+            if (slot < 0)
+                num_new++;
+        }
+    }
 
     for (j = 0; j < NUM_ENV_TO_PROPAGATE; j++) {
         if ((DYNAMO_OPTION(follow_children) || j == ENV_PROP_EXE_PATH) && need_var[j] &&
@@ -6297,6 +6703,30 @@ add_dr_env_vars(dcontext_t *dcontext, char *inject_library_path, const char *app
             new_envp[prop_idx[ENV_PROP_RUNUNDER]][0] = 'X';
         }
     }
+
+    /* Propagate the variables early injection hid from this application, only
+     * to a child DR injects (by -follow_children or by its own registration).
+     * The application's own environment no longer carries them. A child DR
+     * expects to fail to inject runs natively and must not see them.
+     */
+    for (j = 0; hidden_slot != NULL && j < num_private; j++) {
+        int slot = hidden_slot[j];
+        if (slot == HIDDEN_SKIP)
+            continue;
+        if (slot == HIDDEN_APPEND)
+            slot = idx++;
+        sz = strlen(our_environ[j]) + 1;
+        var = heap_alloc(dcontext, sizeof(char) * sz HEAPACCT(ACCT_OTHER));
+        memcpy(var, our_environ[j], sz);
+        new_envp[slot] = var;
+        LOG(THREAD, LOG_SYSCALLS, 2, "\tnew env %d: %s\n", slot, new_envp[slot]);
+    }
+    if (hidden_slot != NULL) {
+        heap_free(dcontext, hidden_slot,
+                  sizeof(int) * (num_private + 1) HEAPACCT(ACCT_OTHER));
+    }
+#undef HIDDEN_SKIP
+#undef HIDDEN_APPEND
 
     sz = strlen(DYNAMORIO_VAR_EXECVE) + 4;
     /* we always pass this var to indicate "post-execve" */
@@ -6553,7 +6983,7 @@ handle_execve(dcontext_t *dcontext)
     }
 
     if (should_inject)
-        add_dr_env_vars(dcontext, inject_library_path, fname);
+        add_dr_env_vars(dcontext, inject_library_path, fname, !expect_to_fail);
     else {
         dcontext->sys_param0 = 0;
         dcontext->sys_param1 = 0;
@@ -6567,14 +6997,40 @@ handle_execve(dcontext_t *dcontext)
         /* i#909: change the target image to libdynamorio.so */
         const char *drpath = IF_X64_ELSE(x64, !x64) ? dynamorio_library_filepath
                                                     : dynamorio_alt_arch_filepath;
+        dcontext->sys_param3 = 0;
         TRY_EXCEPT(
             dcontext, /* try */
             {
-                if (symlink_is_self_exe(argv[0])) {
-                    /* we're out of sys_param entries so we assume argv[0] == fname
+                /* Linux accepts a NULL or empty argv; there is no argv[0] to
+                 * fix up then, and the child must still be redirected to DR
+                 * (it has been given DR's and the hidden variables).
+                 */
+                if (argv != NULL && argv[0] != NULL && symlink_is_self_exe(argv[0])) {
+                    /* Fix argv[0] up in a private copy: the application's
+                     * array may be read-only, and a fault here would leave
+                     * the child unredirected, running natively with DR's and
+                     * the hidden variables. The block starts with the copy's
+                     * length and the application's array, for
+                     * handle_execve_post(); it is owned (sys_param3) before
+                     * the application's array is read again, and the copy is
+                     * terminated here, whatever the application's array holds
+                     * by then.
                      */
-                    dcontext->sys_param3 = (reg_t)argv;
-                    argv[0] = fname; /* XXX: handle readable but not writable! */
+                    ptr_uint_t num_args = 0;
+                    const char **block;
+                    const char **copy;
+                    while (argv[num_args] != NULL)
+                        num_args++;
+                    block = (const char **)heap_alloc(
+                        dcontext, sizeof(char *) * (num_args + 3) HEAPACCT(ACCT_OTHER));
+                    block[0] = (const char *)num_args;
+                    block[1] = (const char *)argv;
+                    dcontext->sys_param3 = (reg_t)block;
+                    copy = block + 2;
+                    memcpy(copy, argv, sizeof(char *) * num_args);
+                    copy[0] = fname;
+                    copy[num_args] = NULL;
+                    *sys_param_addr(dcontext, 1) = (reg_t)copy;
                 } else
                     dcontext->sys_param3 = 0;        /* no restore in post */
                 dcontext->sys_param4 = (reg_t)fname; /* store for restore in post */
@@ -6584,6 +7040,13 @@ handle_execve(dcontext_t *dcontext)
             },
             /* except */
             {
+                if (dcontext->sys_param3 != 0) {
+                    /* The copy was allocated but not installed. */
+                    const char **block = (const char **)dcontext->sys_param3;
+                    heap_free(dcontext, (void *)block,
+                              sizeof(char *) *
+                                  ((ptr_uint_t)block[0] + 3) HEAPACCT(ACCT_OTHER));
+                }
                 dcontext->sys_param3 = 0; /* no restore in post */
                 dcontext->sys_param4 = 0; /* no restore in post */
                 LOG(THREAD, LOG_SYSCALLS, 2,
@@ -6621,9 +7084,11 @@ handle_execve_post(dcontext_t *dcontext)
         /* restore original /proc/.../exe */
         *sys_param_addr(dcontext, 0) = dcontext->sys_param4;
         if (dcontext->sys_param3 != 0) {
-            /* restore original argv[0] */
-            const char **argv = (const char **)dcontext->sys_param3;
-            argv[0] = (const char *)dcontext->sys_param4;
+            /* restore the application's argv and free the private copy */
+            const char **block = (const char **)dcontext->sys_param3;
+            *sys_param_addr(dcontext, 1) = (reg_t)block[1];
+            heap_free(dcontext, (void *)block,
+                      sizeof(char *) * ((ptr_uint_t)block[0] + 3) HEAPACCT(ACCT_OTHER));
         }
     }
 #endif
@@ -7262,6 +7727,16 @@ handle_clone_pre(dcontext_t *dcontext)
             return false;
         }
         flags = dr_clone_args->flags;
+        /* Classify only this owned full copy, after established no-child
+         * errors and before child stack/TLS setup. An earlier client read of
+         * application clone_args cannot authorize a later mutable read. */
+        if (dcontext->client_data->returning_shared_vm_refused != NULL &&
+            TEST(CLONE_VM, flags)) {
+            *dcontext->client_data->returning_shared_vm_refused = true;
+            heap_free(dcontext, dr_clone_args,
+                      app_clone_args_size HEAPACCT(ACCT_OTHER));
+            return false;
+        }
 
         /* Save for post_system_call */
         /* We need to save the pointer to the app's clone_args so that we can restore it
@@ -7285,6 +7760,11 @@ handle_clone_pre(dcontext_t *dcontext)
             dr_clone_args->stack_size);
     } else {
         flags = (uint)sys_param(dcontext, 0);
+        if (dcontext->client_data->returning_shared_vm_refused != NULL &&
+            TEST(CLONE_VM, flags)) {
+            *dcontext->client_data->returning_shared_vm_refused = true;
+            return false;
+        }
         /* Save for post_system_call.
          * Unlike clone3, here the flags are 32-bit, so truncation is okay.
          */
@@ -7384,11 +7864,60 @@ handle_clone_pre(dcontext_t *dcontext)
  * must set mcontext's register for that.
  */
 
+static void
+retire_private_reservations_for_syscall(int sysnum, const reg_t args[6])
+{
+#if defined(LINUX) && defined(X64)
+    /* Withdraw only the client's ownership fact, before any possible kernel
+     * transfer. This common path also runs for returning injections which
+     * intentionally suppress client syscall events. Never change the syscall
+     * arguments/result, and never restore authority merely because it failed. */
+    switch (sysnum) {
+    case SYS_mmap:
+        if (TEST(MAP_FIXED, args[3]))
+            heap_retire_private_reservation_overlap((byte *)args[0], args[1]);
+        break;
+    case SYS_munmap:
+        heap_retire_private_reservation_overlap((byte *)args[0], args[1]);
+        break;
+    case SYS_mremap: {
+        size_t old_size = args[1];
+        size_t new_size = args[2];
+        /* Include possible in-place expansion and zero-size alias requests. */
+        heap_retire_private_reservation_overlap((byte *)args[0], MAX(old_size, new_size));
+        if (TEST(2 /* MREMAP_FIXED */, args[3]))
+            heap_retire_private_reservation_overlap((byte *)args[4], new_size);
+        break;
+    }
+#    ifdef SYS_shmat
+    case SYS_shmat:
+        /* SHM_REMAP's length is an object property, not a syscall argument.
+         * With no authoritative extent, withdraw the bounded fact entirely. */
+        if (TEST(040000 /* SHM_REMAP */, args[2]))
+            heap_retire_private_reservations();
+        break;
+#    endif
+    default: break;
+    }
+#else
+    (void)sysnum;
+    (void)args;
+#endif
+}
+
+DR_API
+void
+dr_test_private_reservation_syscall(int sysnum, const reg_t args[6])
+{
+    /* Test the exact production dispatch/overlap/notification path without
+     * executing an unsafe kernel operation on DynamoRIO's live reservations. */
+    retire_private_reservations_for_syscall(sysnum, args);
+}
+
 /* Returns false if system call should NOT be executed (in which case,
  * post_system_call() will *not* be called!).
- * Returns true if system call should go ahead
- */
-/* XXX: split out specific handlers into separate routines
+ * Returns true if system call should go ahead.
+ * XXX: split out specific handlers into separate routines.
  */
 bool
 pre_system_call(dcontext_t *dcontext)
@@ -7409,6 +7938,13 @@ pre_system_call(dcontext_t *dcontext)
      * in syscall itself)
      */
     dcontext->sys_num = os_normalized_sysnum((int)MCXT_SYSNUM_REG(mc), NULL, dcontext);
+
+#if defined(LINUX) && defined(X64)
+    reg_t private_memory_args[6];
+    for (uint i = 0; i < 6; ++i)
+        private_memory_args[i] = sys_param(dcontext, i);
+    retire_private_reservations_for_syscall(dcontext->sys_num, private_memory_args);
+#endif
 
     RSTATS_INC(pre_syscall);
     DOSTATS({
@@ -7778,6 +8314,13 @@ pre_system_call(dcontext_t *dcontext)
 
 #ifdef SYS_vfork
     case SYS_vfork: {
+#    ifdef LINUX
+        if (dcontext->client_data->returning_shared_vm_refused != NULL) {
+            *dcontext->client_data->returning_shared_vm_refused = true;
+            execute_syscall = false;
+            break;
+        }
+#    endif
         /* treat as if sys_clone with flags just as sys_vfork does */
         /* in /usr/src/linux/arch/i386/kernel/process.c */
         uint flags = CLONE_VFORK | CLONE_VM | SIGCHLD;
@@ -7964,6 +8507,13 @@ pre_system_call(dcontext_t *dcontext)
         }
         break;
     }
+#ifdef LINUX
+    case SYS_rt_sigpending: {
+        dcontext->sys_param0 = sys_param(dcontext, 0);
+        dcontext->sys_param1 = sys_param(dcontext, 1);
+        break;
+    }
+#endif
 #ifdef MACOS
     case SYS_sigsuspend_nocancel:
 #endif
@@ -7972,15 +8522,18 @@ pre_system_call(dcontext_t *dcontext)
            asmlinkage int
            sys_rt_sigsuspend(sigset_t *unewset, size_t sigsetsize)
          */
-        /* TODO i#7955: If a signal is already pending (either because it was blocked
-         * and is now unblocked by sigsuspend, or because it was already unblocked
-         * but delayed by DR), executing sigsuspend may hang because the signal
-         * was already consumed by DR's signal handler. We should detect this (e.g.,
-         * check signals_pending > 0 after handle_sigsuspend) and preemptively deliver
-         * the signal and skip/re-execute the syscall.
-         */
+#ifdef LINUX
+        int status = handle_pre_sigsuspend(
+            dcontext, (const kernel_sigset_t *)sys_param(dcontext, 0),
+            (size_t)sys_param(dcontext, 1));
+        if (status != 0) {
+            set_failure_return_val(dcontext, status);
+            execute_syscall = false;
+        }
+#else
         handle_sigsuspend(dcontext, (kernel_sigset_t *)sys_param(dcontext, 0),
                           (size_t)sys_param(dcontext, 1));
+#endif
         break;
     }
 #ifdef LINUX
@@ -8132,7 +8685,10 @@ pre_system_call(dcontext_t *dcontext)
     case SYS_rt_sigqueueinfo: /* 178 */
     case SYS_rt_tgsigqueueinfo:
 #endif
-    case IF_MACOS_ELSE(SYS_sigpending, SYS_rt_sigpending): { /* 176 */
+#ifdef MACOS
+    case SYS_sigpending:
+#endif
+    {
         /* XXX i#92: handle all of these syscalls! */
         LOG(THREAD, LOG_ASYNCH | LOG_SYSCALLS, 1,
             "WARNING: unhandled signal system call %d\n", dcontext->sys_num);
@@ -8179,6 +8735,9 @@ pre_system_call(dcontext_t *dcontext)
     case SYS_pselect6_time64:
 #    endif
     case SYS_pselect6: {
+        if (dcontext->client_data->returning_syscall_purpose ==
+            DR_SYSCALL_INJECTION_PSELECT6_WRAPPER_VALIDATION)
+            break;
         typedef struct {
             kernel_sigset_t *sigmask;
             size_t sizemask;
@@ -9551,6 +10110,21 @@ post_system_call(dcontext_t *dcontext)
         }
         break;
     }
+#ifdef LINUX
+    case SYS_rt_sigsuspend:
+        handle_post_sigsuspend(dcontext);
+        break;
+    case SYS_rt_sigpending: {
+        if (success) {
+            int status = handle_post_sigpending(
+                dcontext, (kernel_sigset_t *)dcontext->sys_param0,
+                (size_t)dcontext->sys_param1);
+            if (status != 0)
+                set_failure_return_val(dcontext, status);
+        }
+        break;
+    }
+#endif
 #if defined(LINUX) && !defined(X64)
     case SYS_sigreturn: /* 119 */
 #endif
@@ -9599,6 +10173,9 @@ post_system_call(dcontext_t *dcontext)
     case SYS_pselect6_time64:
 #    endif
     case SYS_pselect6: {
+        if (dcontext->client_data->returning_syscall_purpose ==
+            DR_SYSCALL_INJECTION_PSELECT6_WRAPPER_VALIDATION)
+            break;
         if (dcontext->sys_param4 == (reg_t)NULL)
             break;
         typedef struct {
